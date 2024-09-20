@@ -1,12 +1,3 @@
-#----------------------------------------------------------------------
-# NOTE: For deployment instructions, refer to the DoEKS website.
-#----------------------------------------------------------------------
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: stablediffusion
----
 apiVersion: ray.io/v1
 kind: RayService
 metadata:
@@ -25,6 +16,7 @@ spec:
         route_prefix: "/"
         runtime_env:
           env_vars:
+            MODEL_PATH: "./stable-diffusion-2"
             MODEL_ID: "stabilityai/stable-diffusion-2-1"
           pip:
             - transformers==4.25.1
@@ -38,7 +30,7 @@ spec:
               look_back_period_s: 2
               downscale_delay_s: 600
               upscale_delay_s: 30
-              target_num_ongoing_requests_per_replica: 1
+              target_ongoing_requests: 1
             graceful_shutdown_timeout_s: 5
             max_concurrent_queries: 100
             ray_actor_options:
@@ -82,6 +74,10 @@ spec:
               volumeMounts:
                 - mountPath: /tmp/ray
                   name: ray-logs
+                - mountPath: /serve_app/stable-diffusion-2
+                  name: cache-dir
+                - mountPath: /serve_app
+                  name: serve-script
               resources:
                 limits:
                   cpu: 2
@@ -93,8 +89,15 @@ spec:
             NodeGroupType: x86-cpu-karpenter
             type: karpenter
           volumes:
+            - name: serve-script
+              configMap:
+                name: stable-diffusion-script
+                defaultMode: 0777
             - name: ray-logs
               emptyDir: {}
+            - name: cache-dir
+              persistentVolumeClaim:
+                claimName: s3-model-storage-claim
     workerGroupSpecs:
       - groupName: gpu
         # With g5.2xlarge instance, Ray can scale up to 4 nodes, with one pod per node and 1 GPU per pod.
@@ -125,6 +128,11 @@ spec:
                     cpu: "3"
                     memory: "14Gi"
                     nvidia.com/gpu: 1
+                volumeMounts:
+                  - mountPath: /serve_app/stable-diffusion-2
+                    name: cache-dir
+                  - mountPath: /serve_app
+                    name: serve-script
             nodeSelector:
               NodeGroupType: g5-gpu-karpenter
               type: karpenter
@@ -132,6 +140,14 @@ spec:
               - key: "nvidia.com/gpu"
                 operator: "Exists"
                 effect: "NoSchedule"
+            volumes:
+            - name: serve-script
+              configMap:
+                name: stable-diffusion-script
+                defaultMode: 0777
+            - name: cache-dir
+              persistentVolumeClaim:
+                claimName: s3-model-storage-claim
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -164,3 +180,74 @@ spec:
             name: stablediffusion
             port:
               number: 8000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stable-diffusion-script
+  namespace: stablediffusion
+data:
+  ray_serve_sd.py: |
+    from io import BytesIO
+    from fastapi import FastAPI
+    from fastapi.responses import Response
+    import torch
+    import os
+    import ray
+    from ray import serve
+
+    app = FastAPI()
+
+    @serve.deployment(num_replicas=1)
+    @serve.ingress(app)
+    class APIIngress:
+        def __init__(self, diffusion_model_handle) -> None:
+            self.handle = diffusion_model_handle
+
+        @app.get(
+            "/imagine",
+            responses={200: {"content": {"image/png": {}}}},
+            response_class=Response,
+        )
+        async def generate(self, prompt: str, img_size: int = 768):
+            assert len(prompt), "prompt parameter cannot be empty"
+
+            image = await self.handle.generate.remote(prompt, img_size=img_size)
+            file_stream = BytesIO()
+            image.save(file_stream, "PNG")
+            return Response(content=file_stream.getvalue(), media_type="image/png")
+
+
+    @serve.deployment(
+        name="stable-diffusion-v2",
+        ray_actor_options={"num_gpus": 1},
+        autoscaling_config={"min_replicas": 1, "max_replicas": 2},
+    )
+    class StableDiffusionV2:
+        def __init__(self):
+            from diffusers import EulerDiscreteScheduler, StableDiffusionPipeline
+
+            model_id = os.getenv("MODEL_ID")
+            model_path = os.getenv("MODEL_PATH")
+            if model_path is not None:
+                model_id = model_path
+
+            self.pipe = StableDiffusionPipeline.from_pretrained(
+                model_id, torch_dtype=torch.float16
+            )
+            self.pipe = self.pipe.to("cuda")
+
+        def generate(self, prompt: str, img_size: int = 768):
+            assert len(prompt), "prompt parameter cannot be empty"
+
+            image = self.pipe(
+                prompt,
+                height=img_size,
+                width=img_size,
+                negative_prompt="",
+                num_inference_steps=50,
+                guidance_scale=7.0,
+            ).images[0]
+            return image
+
+    entrypoint = APIIngress.bind(StableDiffusionV2.bind())
